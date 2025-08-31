@@ -249,19 +249,26 @@ int main(int argc, char** argv){
                     prev_linesize = luma_linesize;
                     host_prev_alloc = true;
                 } else {
-                    // compute MAD between prev_dev_ptr (host) and current host pointer
+                    // compute MAD between prev_dev_ptr (host) and current host pointer with optional downscale sampling
                     uint8_t* cur = (uint8_t*)processing_frame->data[0];
+                    int ds = args.downscale < 1 ? 1 : args.downscale;
+                    int sampW = (width + ds - 1) / ds;
+                    int sampH = (height + ds - 1) / ds;
                     double sum = 0.0;
-                    for (int y=0;y<height;++y){
+                    for (int y_ds=0;y_ds<sampH;++y_ds){
+                        int y = y_ds * ds; if (y >= height) y = height - 1;
                         const uint8_t* r0 = prev_dev_ptr + y*prev_linesize;
                         const uint8_t* r1 = cur + y*luma_linesize;
-                        for (int x=0;x<width;++x) sum += fabs((double)r0[x] - (double)r1[x]);
+                        for (int x_ds=0;x_ds<sampW;++x_ds){
+                            int x = x_ds * ds; if (x >= width) x = width - 1;
+                            sum += fabs((double)r0[x] - (double)r1[x]);
+                        }
                     }
-                    double mad = sum / (width*(double)height);
+                    double mad = sum / (sampW * (double)sampH);
                     double ts = frame_idx * frame_time;
                     bool isCut = mad > args.threshold && (ts - last_cut_time)*1000.0 > args.minGapMs;
                     if (isCut){ last_cut_time = ts; std::cout<<ts<<", frame "<<frame_idx<<", mad="<<mad<<"\n"; if(csv) csv<<ts<<","<<frame_idx<<","<<mad<<"\n"; }
-                    // replace previous buffer
+                    // replace previous buffer (full-resolution copy for next comparison)
                     memcpy((void*)prev_dev_ptr, cur, luma_linesize*height);
                 }
 

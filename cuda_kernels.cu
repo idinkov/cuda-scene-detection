@@ -8,31 +8,39 @@
 #include <cstdlib>
 
 extern "C" {
-float compute_mad_cuda(const uint8_t* frameA_dev, int pitchA, const uint8_t* frameB_dev, int pitchB, int width, int height);
+float compute_mad_cuda(const uint8_t* frameA_dev, int pitchA, const uint8_t* frameB_dev, int pitchB, int width, int height, int downscale);
 }
 
 // Kernel: each thread accumulates a local sum across a strided set of pixels and atomically adds to a global 64-bit accumulator.
-static __global__ void mad_kernel(const uint8_t* __restrict__ a, int pitchA, const uint8_t* __restrict__ b, int pitchB, int width, int height, unsigned long long* out_sum) {
+static __global__ void mad_kernel(const uint8_t* __restrict__ a, int pitchA, const uint8_t* __restrict__ b, int pitchB, int width, int height, int downscale, unsigned long long* out_sum) {
+    if (downscale < 1) downscale = 1;
+    int dsWidth = (width + downscale - 1) / downscale;
+    int dsHeight = (height + downscale - 1) / downscale;
+    unsigned int total = (unsigned int)dsWidth * (unsigned int)dsHeight;
     unsigned long long local = 0ULL;
     unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned int stride = blockDim.x * gridDim.x;
-    unsigned int total = (unsigned int)width * (unsigned int)height;
 
     for (unsigned int i = tid; i < total; i += stride) {
-        unsigned int y = i / width;
-        unsigned int x = i - y * width;
+        unsigned int y_ds = i / dsWidth;
+        unsigned int x_ds = i - y_ds * dsWidth;
+        unsigned int y = y_ds * downscale; if (y >= (unsigned)height) y = height - 1;
+        unsigned int x = x_ds * downscale; if (x >= (unsigned)width) x = width - 1;
         int va = a[y * pitchA + x];
         int vb = b[y * pitchB + x];
-        local += (unsigned long long) (va > vb ? va - vb : vb - va);
+        local += (unsigned long long)(va > vb ? va - vb : vb - va);
     }
 
     if (local) atomicAdd(out_sum, local);
 }
 
 // Host wrapper
-extern "C" float compute_mad_cuda(const uint8_t* frameA_dev, int pitchA, const uint8_t* frameB_dev, int pitchB, int width, int height) {
+extern "C" float compute_mad_cuda(const uint8_t* frameA_dev, int pitchA, const uint8_t* frameB_dev, int pitchB, int width, int height, int downscale) {
     if (!frameA_dev || !frameB_dev || width <= 0 || height <= 0) return 0.0f;
-
+    if (downscale < 1) downscale = 1;
+    int dsWidth = (width + downscale - 1) / downscale;
+    int dsHeight = (height + downscale - 1) / downscale;
+    unsigned int total = (unsigned int)dsWidth * (unsigned int)dsHeight;
     unsigned long long* d_accum = nullptr;
     cudaError_t cerr = cudaMalloc((void**)&d_accum, sizeof(unsigned long long));
     if (cerr != cudaSuccess) {
@@ -46,17 +54,13 @@ extern "C" float compute_mad_cuda(const uint8_t* frameA_dev, int pitchA, const u
         return 0.0f;
     }
 
-    const unsigned int total = (unsigned int)width * (unsigned int)height;
     const int threads = 256;
     unsigned int blocks = (total + threads - 1) / threads;
     if (blocks == 0) blocks = 1;
     // Clamp grid size to a reasonable value (avoid extremely large grids)
     if (blocks > 65535) blocks = 65535;
 
-    dim3 grid(blocks);
-    dim3 block(threads);
-
-    mad_kernel<<<grid, block>>>(frameA_dev, pitchA, frameB_dev, pitchB, width, height, d_accum);
+    mad_kernel<<<blocks, threads>>>(frameA_dev, pitchA, frameB_dev, pitchB, width, height, downscale, d_accum);
     cerr = cudaGetLastError();
     if (cerr != cudaSuccess) {
         fprintf(stderr, "Kernel launch failed: %s\n", cudaGetErrorString(cerr));
