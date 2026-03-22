@@ -244,6 +244,10 @@ int main(int argc, char** argv){
                 // For simplicity we call compute_mad_cuda with host pointer but that function expects device pointer; in a production app you'd cudaMalloc & cudaMemcpy here.
                 // We'll skip this complex path in this demo; instead, we fall back to CPU-based MAD for this frame.
 
+                // box mode is GPU-only: warn once and fall back to stride on CPU path.
+                if (args.downscaleMode == "box" && frame_idx == 0)
+                    std::cerr << "Warning: --downscale-mode box is GPU-only; falling back to stride sampling on CPU path.\n";
+
                 // CPU fallback MAD (very simple)
                 if (prev_dev_ptr == nullptr) {
                     // store host luma pointer for next iteration via a copied host buffer

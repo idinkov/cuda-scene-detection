@@ -201,17 +201,12 @@ extern "C" float compute_mad_cuda_box(
     }
 
     // Downscale both planes using the box filter.
+    // Both kernels run in the default stream, so launch ordering guarantees the
+    // MAD kernel below sees completed writes.  compute_mad_cuda() calls its own
+    // cudaDeviceSynchronize(), so no extra sync is needed here.
     bool ok = downscale_luma_box(frameA_dev, pitchA, ds_a, (int)ds_pitchA, width, height, downscale)
            && downscale_luma_box(frameB_dev, pitchB, ds_b, (int)ds_pitchB, width, height, downscale);
     if (!ok) {
-        cudaFree(ds_a); cudaFree(ds_b);
-        return 0.0f;
-    }
-
-    // Synchronize so MAD kernel sees the completed downscaled data.
-    ce = cudaDeviceSynchronize();
-    if (ce != cudaSuccess) {
-        fprintf(stderr, "compute_mad_cuda_box: sync after downscale failed: %s\n", cudaGetErrorString(ce));
         cudaFree(ds_a); cudaFree(ds_b);
         return 0.0f;
     }

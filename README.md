@@ -13,11 +13,11 @@ Lightweight demo tool that decodes video with FFmpeg + NVIDIA NVDEC (CUDA) and d
 1. Decode frames (prefer NVDEC). Obtain NV12 / YUV420 luma plane.
 2. Downsample the luma plane using the selected `--downscale-mode`:
    - **stride** (default): logical stride-sampling — picks every Nth pixel, no averaging.
-   - **box**: GPU box-filter (average-pooling) kernel — averages each N×N block to one output pixel before comparison. Produces a smoother, less-noisy sampled image at the cost of an extra kernel launch per frame.
+   - **box**: GPU box-filter (average-pooling) kernel — averages each N×N block to one output pixel before comparison. Produces a smoother, less-noisy sampled image at the cost of 2 extra kernel launches per frame pair (one per luma plane).
 3. Compute sum(|Y_t - Y_{t-1}|) and divide by sampled pixel count => MAD.
 4. Declare a cut if MAD > threshold AND time since last cut > min gap.
 
-GPU path: two pitched device buffers (previous/current). Kernel launches with 256 threads per block (stride mode) or a 2-D 16×16 thread-block grid (box mode). In box mode a `downscale_box_kernel` first averages each N×N source block into one output pixel using `__ldg` read-only cached loads, then the MAD kernel runs on the smaller downscaled images. Result is copied back and normalized.
+GPU path: two pitched device buffers (previous/current). Kernel launches with 256 threads per block (stride mode) or a 2-D 16×16 thread-block grid (box mode). In box mode `downscale_box_kernel` is launched twice per frame pair (once per luma plane) using `__ldg` read-only cached loads to average each N×N source block into one output pixel, then the MAD kernel runs on the smaller downscaled images. Result is copied back and normalized.
 
 ## Build Requirements
 - NVIDIA GPU + driver supporting CUDA and NVDEC.
@@ -69,7 +69,7 @@ Options:
 - `--downscale` (int, default 2): Spatial sampling factor (1 = full res). Higher = faster, fewer pixels sampled.
 - `--downscale-mode` (`stride`|`box`, default `stride`): Downscale algorithm.
   - `stride`: pick every Nth pixel — fast, one kernel, slightly noisier at high `--downscale` values.
-  - `box`: GPU box-filter (average-pool) each N×N block — better sampling quality, one extra kernel launch per frame pair.
+  - `box`: GPU box-filter (average-pool) each N×N block — better sampling quality, 2 extra kernel launches per frame pair (one per luma plane) plus per-call temp buffer allocations. GPU-only; falls back to stride with a warning on the CPU path.
 - `--csv` (path): Write `timestamp,frame_idx,mad` lines for each detected cut.
 - `--verbose`: Extra diagnostic logs.
 
@@ -110,7 +110,7 @@ When `--csv file.csv` is specified, only detected cuts are written (not every fr
 | Mode | How it works | Speed | Quality |
 |------|-------------|-------|---------|
 | `stride` | Reads every Nth pixel | Fastest (1 kernel, minimal reads) | Noisier at high downscale factors; aliasing possible |
-| `box` | Averages each N×N block (GPU box-filter) | Slightly slower (1 extra kernel + temp buffers) | Smoother MAD signal, less sensitive to single-pixel noise |
+| `box` | Averages each N×N block (GPU box-filter) | Slightly slower (2 extra kernel launches + temp buffers per frame pair; GPU-only) | Smoother MAD signal, less sensitive to single-pixel noise |
 
 **Recommendations:**
 - Use `stride` for fast scanning or low downscale values (≤ 2).

@@ -157,10 +157,10 @@ static void test_box_downscale_one() {
 }
 
 // downscale_luma_box: verify that a checkerboard (0/255 alternating) averages
-// to ≈ 127 after a 2×2 box downscale.
+// to 128 after a 2×2 box downscale with round-to-nearest.
 static void test_box_downscale_averaging() {
     int w = 64, h = 64;
-    // Build a host checkerboard (each 2×2 block is half 0, half 255 → average 127)
+    // Build a host checkerboard (each 2×2 block is half 0, half 255 → average 127.5 → 128 with round-to-nearest)
     size_t pitchH = (size_t)w; // for host buffer (no padding)
     std::vector<uint8_t> host_src(pitchH * h);
     for (int y = 0; y < h; ++y)
