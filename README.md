@@ -6,14 +6,20 @@ Lightweight demo tool that decodes video with FFmpeg + NVIDIA NVDEC (CUDA) and d
 - Hardware accelerated H.264 / HEVC decode via FFmpeg (CUVID / AVHWDeviceType CUDA).
 - Zero‑copy path for NV12 luma when available.
 - CUDA kernel computes MAD with optional spatial downscale sampling.
-- Optional CSV output of detected cuts.
+- Hard scene cut detection (single-frame MAD spike above threshold).
+- Gradual transition detection (dissolves / fades) via sliding-window twin-comparison algorithm.
+- Optional CSV output of detected cuts and/or gradual transitions.
 - Graceful fallback to CPU MAD when frames are not on the GPU (still functional, slower).
 
 ## Algorithm (summary)
 1. Decode frames (prefer NVDEC). Obtain NV12 / YUV420 luma plane.
 2. Downsample logically by strided sampling factor `--downscale` (no resize kernel, just sampling points).
 3. Compute sum(|Y_t - Y_{t-1}|) and divide by sampled pixel count => MAD.
-4. Declare a cut if MAD > threshold AND time since last cut > min gap.
+4. **Hard cut**: Declare a cut if MAD > threshold AND time since last cut > min gap.
+5. **Gradual transition** (dissolves / fades, enabled with `--detect-gradual`): Apply a
+   twin-comparison sliding window — count consecutive frames where MAD exceeds a lower
+   threshold (`--gradual-low-threshold`). When the count reaches `--gradual-min-consecutive`,
+   declare a gradual transition.
 
 GPU path: two pitched device buffers (previous/current). Kernel launches with 256 threads per block; each thread iterates over a strided subset accumulating into a 64‑bit global atomic counter. Result is copied back and normalized.
 
@@ -60,23 +66,38 @@ Or use CMake by adapting `CMakeLists.txt` (add pkg-config discovery as commented
 ## Usage
 ```
 nvdec_scene_detect <input> [--threshold <val>] [--min-gap-ms <ms>] [--downscale <n>] [--csv <file>] [--verbose]
+                           [--detect-gradual] [--gradual-low-threshold <val>] [--gradual-window-size <n>] [--gradual-min-consecutive <n>]
 ```
 Options:
-- `--threshold` (float, default 18.0): MAD cut threshold.
-- `--min-gap-ms` (int, default 400): Minimum time between reported cuts (debounce).
+- `--threshold` (float, default 18.0): MAD cut threshold for hard cut detection.
+- `--min-gap-ms` (int, default 400): Minimum time between reported transitions (debounce).
 - `--downscale` (int, default 2): Spatial sampling stride (1 = full res). Higher = faster, noisier.
-- `--csv` (path): Write `timestamp,frame_idx,mad` lines for each detected cut.
+- `--csv` (path): Write `timestamp,frame_idx,mad[,type]` lines for each detected transition.
 - `--verbose`: Extra diagnostic logs.
+- `--detect-gradual`: Enable gradual transition (dissolve / fade) detection.
+- `--gradual-low-threshold` (float, default 3.0): Lower MAD threshold — frames exceeding this
+  value but below `--threshold` are counted as gradual-transition candidates.
+- `--gradual-window-size` (int, default 15): Size of the sliding MAD window used to compute
+  the average reported for each gradual transition.
+- `--gradual-min-consecutive` (int, default 5): Minimum number of consecutive candidate frames
+  needed to declare a gradual transition.
 
 Example:
 ```
 nvdec_scene_detect sample.mp4 --threshold 20 --min-gap-ms 500 --downscale 4 --csv cuts.csv
 ```
-Console output line example:
+Example with gradual transition detection:
 ```
-12.4667, frame 374, mad=37.21
+nvdec_scene_detect sample.mp4 --detect-gradual --gradual-low-threshold 4 --gradual-min-consecutive 6 --csv transitions.csv
 ```
-Meaning: scene cut at 12.4667s on frame 374 with MAD 37.21.
+Console output line examples:
+```
+12.4667, frame 374, cut, mad=37.21
+18.2000, frame 546, gradual, avg_mad=6.43
+```
+The first line is a hard cut; the second is a detected dissolve or fade.
+
+When `--detect-gradual` is active the CSV gains a `type` column (`cut` or `gradual`).
 
 ## Determining Proper Threshold
 Start with default (18) and inspect a few sample outputs. Increase if you see false positives; decrease if cuts are missed. Because MAD uses only Y plane and simple sampling, optimal values vary by content and downscale factor.
@@ -91,11 +112,12 @@ ffmpeg -decoders | grep cuvid          (Linux/macOS)
 If CUDA device creation fails the program logs a warning and continues in software decode mode.
 
 ## CSV Output
-When `--csv file.csv` is specified, only detected cuts are written (not every frame). Header: `timestamp,frame_idx,mad`.
+When `--csv file.csv` is specified, only detected transitions are written (not every frame).
+- Without `--detect-gradual`: header `timestamp,frame_idx,mad` (backward-compatible).
+- With `--detect-gradual`: header `timestamp,frame_idx,mad,type` where `type` is `cut` or `gradual`.
 
 ## Limitations / TODO
 - Only uses luma plane of NV12 / NV21 / YUV420P. Other pixel formats are skipped (could add swscale path).
-- Only detects hard cuts (no gradual dissolve detection).
 - CPU fallback path currently copies full luma each frame; could be optimized or moved fully to GPU with an upload.
 - No multi-stream batch processing.
 - No adaptive thresholding.
@@ -103,7 +125,7 @@ When `--csv file.csv` is specified, only detected cuts are written (not every fr
 Future enhancements (ideas):
 - Add GPU downscale kernel for better sampling quality.
 - Support additional pixel formats via on-GPU conversion.
-- Sliding window variance / histogram metrics for more robust detection.
+- Histogram-based or Edge Change Ratio (ECR) metrics as an alternative to MAD for gradual transitions.
 - Optional output of all frame MAD values for offline analysis.
 
 ## Troubleshooting

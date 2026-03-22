@@ -41,6 +41,7 @@ References:
 #include <chrono>
 #include <fstream>
 #include <cuda_runtime.h>
+#include "gradual_detection.h"
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -54,7 +55,19 @@ extern "C" {
 // CUDA kernel declaration (implemented in cuda_kernels.cu)
 extern "C" float compute_mad_cuda(const uint8_t* frameA_dev, int pitchA, const uint8_t* frameB_dev, int pitchB, int width, int height, int downscale);
 
-struct Args { std::string input; double threshold=18.0; int minGapMs=400; bool verbose=false; std::optional<std::string> csv; int downscale=2; };
+struct Args {
+    std::string input;
+    double threshold=18.0;
+    int minGapMs=400;
+    bool verbose=false;
+    std::optional<std::string> csv;
+    int downscale=2;
+    // Gradual transition detection (twin-comparison sliding window)
+    bool detectGradual=false;        // --detect-gradual
+    double gradualLowThreshold=3.0;  // --gradual-low-threshold
+    int gradualWindowSize=15;        // --gradual-window-size
+    int gradualMinConsecutive=5;     // --gradual-min-consecutive
+};
 
 static std::optional<Args> parse_args(int argc, char** argv){
     if (argc < 2) return std::nullopt;
@@ -64,6 +77,10 @@ static std::optional<Args> parse_args(int argc, char** argv){
         else if(k=="--csv" && i+1<argc) a.csv=argv[++i];
         else if(k=="--downscale" && i+1<argc) a.downscale=std::max(1, std::stoi(argv[++i]));
         else if(k=="--verbose") a.verbose=true;
+        else if(k=="--detect-gradual") a.detectGradual=true;
+        else if(k=="--gradual-low-threshold" && i+1<argc) a.gradualLowThreshold=std::stod(argv[++i]);
+        else if(k=="--gradual-window-size" && i+1<argc) a.gradualWindowSize=std::max(2, std::stoi(argv[++i]));
+        else if(k=="--gradual-min-consecutive" && i+1<argc) a.gradualMinConsecutive=std::max(2, std::stoi(argv[++i]));
         else { std::cerr<<"Unknown arg: "<<k<<"\n"; return std::nullopt; }
     }
     if (a.downscale < 1) a.downscale = 1; // safety
@@ -76,7 +93,8 @@ static std::string av_err2str_wrap(int err){ char buf[256]; av_strerror(err, buf
 int main(int argc, char** argv){
     av_log_set_level(AV_LOG_ERROR);
     auto parsed = parse_args(argc, argv);
-    if(!parsed){ std::cerr<<"Usage: "<<argv[0]<<" <input> [--threshold <val>] [--min-gap-ms <ms>] [--downscale <n>] [--csv <path>] [--verbose]\n"; return 2; }
+    if(!parsed){ std::cerr<<"Usage: "<<argv[0]<<" <input> [--threshold <val>] [--min-gap-ms <ms>] [--downscale <n>] [--csv <path>] [--verbose]\n"
+                          <<"             [--detect-gradual] [--gradual-low-threshold <val>] [--gradual-window-size <n>] [--gradual-min-consecutive <n>]\n"; return 2; }
     Args args = *parsed;
 
     avformat_network_init();
@@ -126,7 +144,7 @@ int main(int argc, char** argv){
     if (!pkt || !frame || !sw_frame) { std::cerr<<"Alloc fail\n"; return 10; }
 
     std::ofstream csv;
-    if (args.csv) { csv.open(*args.csv); if(!csv) { std::cerr<<"Could not open CSV\n"; } else csv<<"timestamp,frame_idx,mad\n"; }
+    if (args.csv) { csv.open(*args.csv); if(!csv) { std::cerr<<"Could not open CSV\n"; } else csv<<"timestamp,frame_idx,mad"<<(args.detectGradual?",type":"")<<"\n"; }
 
     int64_t frame_idx = 0;
     double last_cut_time = -1e9;
@@ -168,6 +186,27 @@ int main(int argc, char** argv){
     };
 
     bool have_prev = false;
+    // Gradual transition detector (sliding-window twin-comparison)
+    GradualDetector gradualDet(args.gradualLowThreshold, args.gradualWindowSize, args.gradualMinConsecutive);
+
+    // Helper: report a detected transition (cut or gradual) to console and CSV.
+    // Captures all relevant state by reference; call after computing isCut.
+    auto report_transition = [&](double ts, double madVal, bool isCut) {
+        if (isCut) {
+            last_cut_time = ts;
+            std::cout << ts << ", frame " << frame_idx << ", cut, mad=" << madVal << "\n";
+            if (csv) csv << ts << "," << frame_idx << "," << madVal << (args.detectGradual ? ",cut" : "") << "\n";
+        }
+        if (args.detectGradual) {
+            bool isGradual = gradualDet.update((float)madVal, ts, args.minGapMs, isCut);
+            if (isGradual) {
+                double wAvg = gradualDet.windowAvg();
+                std::cout << ts << ", frame " << frame_idx << ", gradual, avg_mad=" << wAvg << "\n";
+                if (csv) csv << ts << "," << frame_idx << "," << wAvg << ",gradual\n";
+            }
+        }
+    };
+
     // Main loop: read packets and send to decoder
     while (av_read_frame(fmt, pkt) >= 0){
         if (pkt->stream_index != video_stream){ av_packet_unref(pkt); continue; }
@@ -267,7 +306,7 @@ int main(int argc, char** argv){
                     double mad = sum / (sampW * (double)sampH);
                     double ts = frame_idx * frame_time;
                     bool isCut = mad > args.threshold && (ts - last_cut_time)*1000.0 > args.minGapMs;
-                    if (isCut){ last_cut_time = ts; std::cout<<ts<<", frame "<<frame_idx<<", mad="<<mad<<"\n"; if(csv) csv<<ts<<","<<frame_idx<<","<<mad<<"\n"; }
+                    report_transition(ts, mad, isCut);
                     // replace previous buffer (full-resolution copy for next comparison)
                     memcpy((void*)prev_dev_ptr, cur, luma_linesize*height);
                 }
@@ -297,7 +336,7 @@ int main(int argc, char** argv){
                 float mad = compute_mad_cuda(prev_dev_owned, (int)prev_pitch, curr_dev_owned, (int)curr_pitch, width, height, args.downscale);
                 double ts = frame_idx * frame_time;
                 bool isCut = mad > args.threshold && (ts - last_cut_time)*1000.0 > args.minGapMs;
-                if (isCut){ last_cut_time = ts; std::cout<<ts<<", frame "<<frame_idx<<", mad="<<mad<<"\n"; if(csv) csv<<ts<<","<<frame_idx<<","<<mad<<"\n"; }
+                report_transition(ts, (double)mad, isCut);
                 // swap buffers for next iteration (so prev holds last frame)
                 std::swap(prev_dev_owned, curr_dev_owned);
                 std::swap(prev_pitch, curr_pitch);

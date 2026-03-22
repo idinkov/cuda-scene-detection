@@ -60,3 +60,10 @@ target_link_libraries(test_mad
 )
 
 add_test(NAME mad_tests COMMAND test_mad)
+
+# === Gradual detection unit tests (CPU only, no CUDA device needed) ===
+add_executable(test_gradual
+        tests/test_gradual.cpp
+)
+target_include_directories(test_gradual PRIVATE ${CMAKE_SOURCE_DIR})
+add_test(NAME gradual_tests COMMAND test_gradual)
