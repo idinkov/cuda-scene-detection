@@ -41,6 +41,7 @@ References:
 #include <chrono>
 #include <fstream>
 #include <cuda_runtime.h>
+#include "adaptive_stats.h"
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -54,7 +55,18 @@ extern "C" {
 // CUDA kernel declaration (implemented in cuda_kernels.cu)
 extern "C" float compute_mad_cuda(const uint8_t* frameA_dev, int pitchA, const uint8_t* frameB_dev, int pitchB, int width, int height, int downscale);
 
-struct Args { std::string input; double threshold=18.0; int minGapMs=400; bool verbose=false; std::optional<std::string> csv; int downscale=2; };
+struct Args {
+    std::string input;
+    double threshold=18.0;
+    int minGapMs=400;
+    bool verbose=false;
+    std::optional<std::string> csv;
+    int downscale=2;
+    // Adaptive thresholding
+    bool adaptive=false;
+    double adaptiveK=3.0;
+    int adaptiveWarmup=30;
+};
 
 static std::optional<Args> parse_args(int argc, char** argv){
     if (argc < 2) return std::nullopt;
@@ -64,6 +76,9 @@ static std::optional<Args> parse_args(int argc, char** argv){
         else if(k=="--csv" && i+1<argc) a.csv=argv[++i];
         else if(k=="--downscale" && i+1<argc) a.downscale=std::max(1, std::stoi(argv[++i]));
         else if(k=="--verbose") a.verbose=true;
+        else if(k=="--adaptive") a.adaptive=true;
+        else if(k=="--adaptive-k" && i+1<argc) a.adaptiveK=std::stod(argv[++i]);
+        else if(k=="--adaptive-warmup" && i+1<argc) a.adaptiveWarmup=std::max(1, std::stoi(argv[++i]));
         else { std::cerr<<"Unknown arg: "<<k<<"\n"; return std::nullopt; }
     }
     if (a.downscale < 1) a.downscale = 1; // safety
@@ -76,8 +91,16 @@ static std::string av_err2str_wrap(int err){ char buf[256]; av_strerror(err, buf
 int main(int argc, char** argv){
     av_log_set_level(AV_LOG_ERROR);
     auto parsed = parse_args(argc, argv);
-    if(!parsed){ std::cerr<<"Usage: "<<argv[0]<<" <input> [--threshold <val>] [--min-gap-ms <ms>] [--downscale <n>] [--csv <path>] [--verbose]\n"; return 2; }
+    if(!parsed){ std::cerr<<"Usage: "<<argv[0]<<" <input> [--threshold <val>] [--min-gap-ms <ms>] [--downscale <n>] [--csv <path>] [--verbose] [--adaptive] [--adaptive-k <k>] [--adaptive-warmup <n>]\n"; return 2; }
     Args args = *parsed;
+
+    AdaptiveStats adaptive_stats;
+    adaptive_stats.enabled      = args.adaptive;
+    adaptive_stats.k            = args.adaptiveK;
+    adaptive_stats.warmupFrames = args.adaptiveWarmup;
+    if (args.verbose && args.adaptive)
+        std::cerr << "Adaptive thresholding enabled: k=" << args.adaptiveK
+                  << " warmup=" << args.adaptiveWarmup << " frames\n";
 
     avformat_network_init();
     AVFormatContext* fmt = nullptr;
@@ -266,7 +289,13 @@ int main(int argc, char** argv){
                     }
                     double mad = sum / (sampW * (double)sampH);
                     double ts = frame_idx * frame_time;
-                    bool isCut = mad > args.threshold && (ts - last_cut_time)*1000.0 > args.minGapMs;
+                    adaptive_stats.update(mad);
+                    double eff_threshold = adaptive_stats.threshold(args.threshold);
+                    bool isCut = mad > eff_threshold && (ts - last_cut_time)*1000.0 > args.minGapMs;
+                    if (args.verbose && args.adaptive && adaptive_stats.warmedUp())
+                        std::cerr << "  frame " << frame_idx << " mad=" << mad
+                                  << " adaptive_threshold=" << eff_threshold
+                                  << " (mean=" << adaptive_stats.mean_ << " stdev=" << adaptive_stats.stdev() << ")\n";
                     if (isCut){ last_cut_time = ts; std::cout<<ts<<", frame "<<frame_idx<<", mad="<<mad<<"\n"; if(csv) csv<<ts<<","<<frame_idx<<","<<mad<<"\n"; }
                     // replace previous buffer (full-resolution copy for next comparison)
                     memcpy((void*)prev_dev_ptr, cur, luma_linesize*height);
@@ -296,7 +325,13 @@ int main(int argc, char** argv){
                 // current frame just copied into curr_dev_owned, compute MAD
                 float mad = compute_mad_cuda(prev_dev_owned, (int)prev_pitch, curr_dev_owned, (int)curr_pitch, width, height, args.downscale);
                 double ts = frame_idx * frame_time;
-                bool isCut = mad > args.threshold && (ts - last_cut_time)*1000.0 > args.minGapMs;
+                adaptive_stats.update(static_cast<double>(mad));
+                double eff_threshold = adaptive_stats.threshold(args.threshold);
+                bool isCut = mad > eff_threshold && (ts - last_cut_time)*1000.0 > args.minGapMs;
+                if (args.verbose && args.adaptive && adaptive_stats.warmedUp())
+                    std::cerr << "  frame " << frame_idx << " mad=" << mad
+                              << " adaptive_threshold=" << eff_threshold
+                              << " (mean=" << adaptive_stats.mean_ << " stdev=" << adaptive_stats.stdev() << ")\n";
                 if (isCut){ last_cut_time = ts; std::cout<<ts<<", frame "<<frame_idx<<", mad="<<mad<<"\n"; if(csv) csv<<ts<<","<<frame_idx<<","<<mad<<"\n"; }
                 // swap buffers for next iteration (so prev holds last frame)
                 std::swap(prev_dev_owned, curr_dev_owned);

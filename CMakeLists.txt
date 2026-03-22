@@ -60,3 +60,14 @@ target_link_libraries(test_mad
 )
 
 add_test(NAME mad_tests COMMAND test_mad)
+
+add_executable(test_adaptive
+        tests/test_adaptive.cu
+)
+
+set_target_properties(test_adaptive PROPERTIES CUDA_RUNTIME_LIBRARY Shared)
+target_link_libraries(test_adaptive
+        CUDA::cudart
+)
+
+add_test(NAME adaptive_tests COMMAND test_adaptive)

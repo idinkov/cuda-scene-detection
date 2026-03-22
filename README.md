@@ -27,10 +27,13 @@ GPU path: two pitched device buffers (previous/current). Kernel launches with 25
 ```
 ffmpeg_nvdec_scene_detect.cpp   Main program
 cuda_kernels.cu                 MAD CUDA kernel
+adaptive_stats.h                Online mean/stdev statistics for adaptive thresholding
 CMakeLists.txt                  Build script (Windows oriented, static path to dependencies/ffmpeg)
 build.bat                       Convenience Windows build script
 install_ffmpeg.bat              (Optional helper if you add logic) placeholder
 dependencies/ffmpeg/            Prebuilt FFmpeg (bin/include/lib)
+tests/test_mad.cu               Unit tests for CUDA MAD kernel
+tests/test_adaptive.cu          Unit tests for adaptive thresholding statistics
 ```
 
 ## Windows Build (Visual Studio + CMake)
@@ -59,18 +62,25 @@ Or use CMake by adapting `CMakeLists.txt` (add pkg-config discovery as commented
 
 ## Usage
 ```
-nvdec_scene_detect <input> [--threshold <val>] [--min-gap-ms <ms>] [--downscale <n>] [--csv <file>] [--verbose]
+nvdec_scene_detect <input> [--threshold <val>] [--min-gap-ms <ms>] [--downscale <n>] [--csv <file>] [--verbose] [--adaptive] [--adaptive-k <k>] [--adaptive-warmup <n>]
 ```
 Options:
-- `--threshold` (float, default 18.0): MAD cut threshold.
+- `--threshold` (float, default 18.0): MAD cut threshold. Also serves as the fallback during adaptive warmup.
 - `--min-gap-ms` (int, default 400): Minimum time between reported cuts (debounce).
 - `--downscale` (int, default 2): Spatial sampling stride (1 = full res). Higher = faster, noisier.
 - `--csv` (path): Write `timestamp,frame_idx,mad` lines for each detected cut.
 - `--verbose`: Extra diagnostic logs.
+- `--adaptive`: Enable adaptive thresholding (threshold = mean + k × stdev of observed MAD values).
+- `--adaptive-k` (float, default 3.0): Standard deviation multiplier *k* used in the adaptive threshold formula.
+- `--adaptive-warmup` (int, default 30): Number of frames to observe before switching from the static threshold to the adaptive one.
 
 Example:
 ```
 nvdec_scene_detect sample.mp4 --threshold 20 --min-gap-ms 500 --downscale 4 --csv cuts.csv
+```
+Example with adaptive thresholding:
+```
+nvdec_scene_detect sample.mp4 --adaptive --adaptive-k 3.0 --adaptive-warmup 60 --csv cuts.csv --verbose
 ```
 Console output line example:
 ```
@@ -80,6 +90,20 @@ Meaning: scene cut at 12.4667s on frame 374 with MAD 37.21.
 
 ## Determining Proper Threshold
 Start with default (18) and inspect a few sample outputs. Increase if you see false positives; decrease if cuts are missed. Because MAD uses only Y plane and simple sampling, optimal values vary by content and downscale factor.
+
+## Adaptive Thresholding
+When `--adaptive` is supplied, the detector maintains a running mean and standard deviation of all observed inter-frame MAD values using Welford's numerically-stable online algorithm. The effective threshold becomes:
+
+```
+threshold = mean(MAD) + k × stdev(MAD)
+```
+
+Where `k` is controlled by `--adaptive-k` (default 3.0). During the initial `--adaptive-warmup` frames (default 30) the static `--threshold` value is used so the first few cuts are still detected. After warmup the adaptive threshold tracks the signal automatically, reducing the need for manual tuning when processing content with varying scene dynamics (e.g., action sequences mixed with slow shots).
+
+**Tips:**
+- Increase `--adaptive-k` (e.g., 4.0–5.0) for content with many quick edits to reduce false positives.
+- Decrease `--adaptive-k` (e.g., 2.0) for slow-paced content or dark scenes where MAD values are naturally low.
+- Use `--verbose` together with `--adaptive` to log the live adaptive threshold value alongside each frame's MAD.
 
 ## Verifying Hardware Acceleration
 Check FFmpeg supports CUDA/NVDEC:
@@ -98,7 +122,6 @@ When `--csv file.csv` is specified, only detected cuts are written (not every fr
 - Only detects hard cuts (no gradual dissolve detection).
 - CPU fallback path currently copies full luma each frame; could be optimized or moved fully to GPU with an upload.
 - No multi-stream batch processing.
-- No adaptive thresholding.
 
 Future enhancements (ideas):
 - Add GPU downscale kernel for better sampling quality.
