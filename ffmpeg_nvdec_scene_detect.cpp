@@ -54,7 +54,7 @@ extern "C" {
 // CUDA kernel declaration (implemented in cuda_kernels.cu)
 extern "C" float compute_mad_cuda(const uint8_t* frameA_dev, int pitchA, const uint8_t* frameB_dev, int pitchB, int width, int height, int downscale);
 
-struct Args { std::string input; double threshold=18.0; int minGapMs=400; bool verbose=false; std::optional<std::string> csv; int downscale=2; };
+struct Args { std::string input; double threshold=18.0; int minGapMs=400; bool verbose=false; std::optional<std::string> csv; std::optional<std::string> allFramesCsv; int downscale=2; };
 
 static std::optional<Args> parse_args(int argc, char** argv){
     if (argc < 2) return std::nullopt;
@@ -62,6 +62,7 @@ static std::optional<Args> parse_args(int argc, char** argv){
     for (int i=2;i<argc;++i){ std::string k=argv[i]; if(k=="--threshold" && i+1<argc) a.threshold=std::stod(argv[++i]);
         else if(k=="--min-gap-ms" && i+1<argc) a.minGapMs=std::stoi(argv[++i]);
         else if(k=="--csv" && i+1<argc) a.csv=argv[++i];
+        else if(k=="--all-frames-csv" && i+1<argc) a.allFramesCsv=argv[++i];
         else if(k=="--downscale" && i+1<argc) a.downscale=std::max(1, std::stoi(argv[++i]));
         else if(k=="--verbose") a.verbose=true;
         else { std::cerr<<"Unknown arg: "<<k<<"\n"; return std::nullopt; }
@@ -76,7 +77,7 @@ static std::string av_err2str_wrap(int err){ char buf[256]; av_strerror(err, buf
 int main(int argc, char** argv){
     av_log_set_level(AV_LOG_ERROR);
     auto parsed = parse_args(argc, argv);
-    if(!parsed){ std::cerr<<"Usage: "<<argv[0]<<" <input> [--threshold <val>] [--min-gap-ms <ms>] [--downscale <n>] [--csv <path>] [--verbose]\n"; return 2; }
+    if(!parsed){ std::cerr<<"Usage: "<<argv[0]<<" <input> [--threshold <val>] [--min-gap-ms <ms>] [--downscale <n>] [--csv <path>] [--all-frames-csv <path>] [--verbose]\n"; return 2; }
     Args args = *parsed;
 
     avformat_network_init();
@@ -128,6 +129,18 @@ int main(int argc, char** argv){
     std::ofstream csv;
     if (args.csv) { csv.open(*args.csv); if(!csv) { std::cerr<<"Could not open CSV\n"; } else csv<<"timestamp,frame_idx,mad\n"; }
 
+    // All-frames CSV: records MAD for every frame, not just detected cuts.
+    // Rows are buffered in memory and flushed every kAllFramesFlushInterval rows to keep I/O efficient.
+    std::ofstream all_frames_csv;
+    std::string all_frames_buf;
+    constexpr size_t kAllFramesFlushInterval = 1024;
+    size_t all_frames_pending = 0;
+    if (args.allFramesCsv) {
+        all_frames_csv.open(*args.allFramesCsv);
+        if (!all_frames_csv) { std::cerr<<"Could not open all-frames CSV\n"; }
+        else all_frames_csv << "timestamp,frame_idx,mad,is_cut\n";
+    }
+
     int64_t frame_idx = 0;
     double last_cut_time = -1e9;
     int video_fps = st->avg_frame_rate.num>0 ? (int)(av_q2d(st->avg_frame_rate)+0.5) : 30;
@@ -165,6 +178,19 @@ int main(int argc, char** argv){
         cudaError_t ce = cudaMemcpy2D(dstPtr, dstPitch, srcPtr, (size_t)srcPitch, (size_t)w, (size_t)h, kind);
         if (ce != cudaSuccess){ std::cerr << "cudaMemcpy2D luma failed: " << cudaGetErrorString(ce) << "\n"; return false; }
         return true;
+    };
+
+    // Record per-frame MAD to all-frames CSV with in-memory buffering.
+    auto record_frame_mad = [&](double ts, int64_t fi, double mad, bool isCut) {
+        if (!all_frames_csv) return;
+        char row[128];
+        std::snprintf(row, sizeof(row), "%.6f,%lld,%.6f,%d\n", ts, (long long)fi, mad, isCut ? 1 : 0);
+        all_frames_buf += row;
+        if (++all_frames_pending >= kAllFramesFlushInterval) {
+            all_frames_csv << all_frames_buf;
+            all_frames_buf.clear();
+            all_frames_pending = 0;
+        }
     };
 
     bool have_prev = false;
@@ -268,6 +294,7 @@ int main(int argc, char** argv){
                     double ts = frame_idx * frame_time;
                     bool isCut = mad > args.threshold && (ts - last_cut_time)*1000.0 > args.minGapMs;
                     if (isCut){ last_cut_time = ts; std::cout<<ts<<", frame "<<frame_idx<<", mad="<<mad<<"\n"; if(csv) csv<<ts<<","<<frame_idx<<","<<mad<<"\n"; }
+                    record_frame_mad(ts, frame_idx, mad, isCut);
                     // replace previous buffer (full-resolution copy for next comparison)
                     memcpy((void*)prev_dev_ptr, cur, luma_linesize*height);
                 }
@@ -298,6 +325,7 @@ int main(int argc, char** argv){
                 double ts = frame_idx * frame_time;
                 bool isCut = mad > args.threshold && (ts - last_cut_time)*1000.0 > args.minGapMs;
                 if (isCut){ last_cut_time = ts; std::cout<<ts<<", frame "<<frame_idx<<", mad="<<mad<<"\n"; if(csv) csv<<ts<<","<<frame_idx<<","<<mad<<"\n"; }
+                record_frame_mad(ts, frame_idx, (double)mad, isCut);
                 // swap buffers for next iteration (so prev holds last frame)
                 std::swap(prev_dev_owned, curr_dev_owned);
                 std::swap(prev_pitch, curr_pitch);
@@ -310,6 +338,7 @@ int main(int argc, char** argv){
 
     end:
     if (csv) csv.close();
+    if (all_frames_csv) { if (!all_frames_buf.empty()) all_frames_csv << all_frames_buf; all_frames_csv.close(); }
     av_packet_free(&pkt);
     av_frame_free(&frame);
     av_frame_free(&sw_frame);

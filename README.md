@@ -59,13 +59,14 @@ Or use CMake by adapting `CMakeLists.txt` (add pkg-config discovery as commented
 
 ## Usage
 ```
-nvdec_scene_detect <input> [--threshold <val>] [--min-gap-ms <ms>] [--downscale <n>] [--csv <file>] [--verbose]
+nvdec_scene_detect <input> [--threshold <val>] [--min-gap-ms <ms>] [--downscale <n>] [--csv <file>] [--all-frames-csv <file>] [--verbose]
 ```
 Options:
 - `--threshold` (float, default 18.0): MAD cut threshold.
 - `--min-gap-ms` (int, default 400): Minimum time between reported cuts (debounce).
 - `--downscale` (int, default 2): Spatial sampling stride (1 = full res). Higher = faster, noisier.
 - `--csv` (path): Write `timestamp,frame_idx,mad` lines for each detected cut.
+- `--all-frames-csv` (path): Write `timestamp,frame_idx,mad,is_cut` lines for **every** frame. Useful for offline threshold tuning and visualising the MAD curve.
 - `--verbose`: Extra diagnostic logs.
 
 Example:
@@ -91,7 +92,17 @@ ffmpeg -decoders | grep cuvid          (Linux/macOS)
 If CUDA device creation fails the program logs a warning and continues in software decode mode.
 
 ## CSV Output
-When `--csv file.csv` is specified, only detected cuts are written (not every frame). Header: `timestamp,frame_idx,mad`.
+Two separate CSV outputs are available:
+
+- `--csv file.csv`: writes one row per **detected cut** with columns `timestamp,frame_idx,mad`.
+- `--all-frames-csv file.csv`: writes one row per **frame** with columns `timestamp,frame_idx,mad,is_cut`, where `is_cut` is `1` when a cut was detected and `0` otherwise. Output is buffered in memory (flushed every 1024 rows) to keep disk I/O efficient.
+
+Both files include a header row. `--all-frames-csv` has no effect on detection performance when omitted.
+
+### Offline analysis use cases
+- **Threshold tuning**: plot the MAD curve and choose a threshold that separates cuts from non-cut transitions.
+- **Gradual transition detection**: identify slow fades as sustained elevated MAD rather than a single spike.
+- **Quality control**: detect anomalous frames (e.g., black frames, artifacts) by looking for near-zero or very high MAD.
 
 ## Limitations / TODO
 - Only uses luma plane of NV12 / NV21 / YUV420P. Other pixel formats are skipped (could add swscale path).
@@ -104,7 +115,6 @@ Future enhancements (ideas):
 - Add GPU downscale kernel for better sampling quality.
 - Support additional pixel formats via on-GPU conversion.
 - Sliding window variance / histogram metrics for more robust detection.
-- Optional output of all frame MAD values for offline analysis.
 
 ## Troubleshooting
 - Decoder not found: ensure FFmpeg build includes the codec and CUDA support (look for `h264_cuvid`, `hevc_cuvid`).
