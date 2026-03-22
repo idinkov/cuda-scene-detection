@@ -6,10 +6,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
-# Adjust to your FFmpeg build location
-if(NOT DEFINED FFMPEG_DIR)
-    set(FFMPEG_DIR "dependencies/ffmpeg/")   # root folder where include/lib are
-endif()
+# Path to your FFmpeg installation (root folder containing include/ and lib/).
+# Override on the command line with -DFFMPEG_DIR=/path/to/ffmpeg, e.g.:
+#   cmake -B build -DFFMPEG_DIR=/usr
+set(FFMPEG_DIR "dependencies/ffmpeg/" CACHE PATH "Root directory of the FFmpeg installation (must contain include/ and lib/)")
 include_directories(${FFMPEG_DIR}/include)
 link_directories(${FFMPEG_DIR}/lib)
 
@@ -34,7 +34,6 @@ else()
             avcodec
             avutil
             swscale
-            cuda
             cudart
     )
 endif()
