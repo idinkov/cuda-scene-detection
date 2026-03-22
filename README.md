@@ -96,9 +96,26 @@ When `--csv file.csv` is specified, only detected cuts are written (not every fr
 ## Limitations / TODO
 - Only uses luma plane of NV12 / NV21 / YUV420P. Other pixel formats are skipped (could add swscale path).
 - Only detects hard cuts (no gradual dissolve detection).
-- CPU fallback path currently copies full luma each frame; could be optimized or moved fully to GPU with an upload.
 - No multi-stream batch processing.
 - No adaptive thresholding.
+
+## CPU Fallback Path Performance
+When frames are decoded in software (no NVDEC), the CPU path now stores only the
+stride-sampled luma pixels (`sampW × sampH` bytes) instead of the full luma plane.
+This eliminates the full-frame `memcpy` per frame that was the prior bottleneck.
+
+| Downscale | Bytes stored (1080p) | Savings vs. original |
+|-----------|---------------------|----------------------|
+| 1         | 2 073 600 B (≈ 2 MB) | — (full res)         |
+| 2         |   518 400 B (≈ 0.5 MB) | 4× smaller         |
+| 4         |   129 600 B (≈ 0.1 MB) | 16× smaller        |
+
+MAD is then computed via **AVX2** (`_mm256_sad_epu8`, 32 B/cycle) when the binary is
+compiled with `-mavx2` / `/arch:AVX2`, falling back to a plain scalar loop otherwise.
+
+When a CUDA device is present (even with software-decoded frames), the sampled pixels
+are uploaded to GPU memory and MAD is computed by the existing `compute_mad_cuda`
+kernel, keeping the hot path on the GPU.
 
 Future enhancements (ideas):
 - Add GPU downscale kernel for better sampling quality.

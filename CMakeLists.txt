@@ -60,3 +60,14 @@ target_link_libraries(test_mad
 )
 
 add_test(NAME mad_tests COMMAND test_mad)
+
+# Enable AVX2 for the CPU MAD path in cpu_mad.h.
+# CXX files in nvdec_scene_detect use the host compiler directly.
+# CUDA files in test_mad use nvcc with -Xcompiler to forward the flag.
+if(MSVC)
+    target_compile_options(nvdec_scene_detect PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/arch:AVX2>)
+    target_compile_options(test_mad PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/arch:AVX2>)
+else()
+    target_compile_options(nvdec_scene_detect PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-mavx2>)
+    target_compile_options(test_mad PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-mavx2>)
+endif()

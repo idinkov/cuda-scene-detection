@@ -41,6 +41,7 @@ References:
 #include <chrono>
 #include <fstream>
 #include <cuda_runtime.h>
+#include "cpu_mad.h"
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -137,17 +138,23 @@ int main(int argc, char** argv){
     // Implementation detail: Many HW-decoded frames for NV12 have two planes: Y (luma) and UV (chroma).
     // For MAD on intensity we only need luma (Y). We'll attempt to retrieve the device pointer for plane 0.
 
-    // previous device buffer info
-    const uint8_t* prev_dev_ptr = nullptr;
-    int prev_linesize = 0;
     int width = dec_ctx->width;
     int height = dec_ctx->height;
-    bool host_prev_alloc = false; // tracks if prev_dev_ptr was malloc'd (CPU path)
 
     // Owned CUDA buffers for previous & current frame luma (device memory we control)
+    // Used by the GPU decode path (luma already on device).
     uint8_t* prev_dev_owned = nullptr; size_t prev_pitch = 0;
     uint8_t* curr_dev_owned = nullptr; size_t curr_pitch = 0;
     bool cuda_buffers_inited = false;
+
+    // CPU-decode path: compact buffers holding only stride-sampled luma pixels.
+    // Avoids storing/copying the full luma plane between frames.
+    uint8_t* sampled_prev_host = nullptr; // previous frame sampled pixels (host)
+    uint8_t* sampled_curr_host = nullptr; // current  frame sampled pixels (host)
+    uint8_t* sampled_prev_dev  = nullptr; // previous frame sampled pixels (device, if GPU available)
+    uint8_t* sampled_curr_dev  = nullptr; // current  frame sampled pixels (device, if GPU available)
+    bool sampled_gpu_inited    = false;
+    bool cpu_path_logged       = false;   // print verbose mode info once
 
     auto ensure_cuda_buffers = [&](int w, int h) -> bool {
         if (cuda_buffers_inited) return true;
@@ -158,6 +165,17 @@ int main(int argc, char** argv){
         ce = cudaMallocPitch((void**)&curr_dev_owned, &curr_pitch, (size_t)w, (size_t)h);
         if (ce != cudaSuccess){ std::cerr << "cudaMallocPitch curr failed: " << cudaGetErrorString(ce) << "\n"; cudaFree(prev_dev_owned); prev_dev_owned=nullptr; return false; }
         cuda_buffers_inited = true; return true;
+    };
+
+    // Allocate flat (non-pitched) GPU buffers for stride-sampled luma from CPU-decoded frames.
+    auto ensure_sampled_gpu_buffers = [&](int n) -> bool {
+        if (sampled_gpu_inited) return true;
+        cudaError_t ce;
+        ce = cudaMalloc((void**)&sampled_prev_dev, (size_t)n);
+        if (ce != cudaSuccess){ std::cerr << "cudaMalloc sampled_prev failed: " << cudaGetErrorString(ce) << "\n"; return false; }
+        ce = cudaMalloc((void**)&sampled_curr_dev, (size_t)n);
+        if (ce != cudaSuccess){ std::cerr << "cudaMalloc sampled_curr failed: " << cudaGetErrorString(ce) << "\n"; cudaFree(sampled_prev_dev); sampled_prev_dev = nullptr; return false; }
+        sampled_gpu_inited = true; return true;
     };
 
     auto copy_luma_to_owned = [&](const uint8_t* srcPtr, int srcPitch, bool srcOnDevice, uint8_t* dstPtr, size_t dstPitch, int w, int h) -> bool {
@@ -230,46 +248,67 @@ int main(int argc, char** argv){
                 continue;
             }
 
-            // If we don't have device luma pointer, perform a software copy to CUDA device using cudaMemcpy (user must have built with CUDA; compute_mad_cuda expects device pointers)
-            // For simplicity we assume dev_luma_ptr points to device memory when hw_device_ctx != null.
+            // CPU-decode path: luma is in host memory.
+            // Optimised approach: extract only the stride-sampled pixels into a compact
+            // buffer (sampW*sampH bytes) instead of copying the full luma plane.
+            // MAD is then computed via AVX2 (if available) or scalar, or uploaded to
+            // the GPU when a CUDA device is present.
             if (!luma_on_device) {
-                // Upload host luma plane to CUDA device memory. We'll use compute_mad_cuda which will internally cudaMalloc and free for temporary buffers.
-                // For simplicity we call compute_mad_cuda with host pointer but that function expects device pointer; in a production app you'd cudaMalloc & cudaMemcpy here.
-                // We'll skip this complex path in this demo; instead, we fall back to CPU-based MAD for this frame.
+                int ds    = args.downscale;  // already clamped to >= 1 by parse_args
+                int sampW = (width  + ds - 1) / ds;
+                int sampH = (height + ds - 1) / ds;
+                int sampN = sampW * sampH;
 
-                // CPU fallback MAD (very simple)
-                if (prev_dev_ptr == nullptr) {
-                    // store host luma pointer for next iteration via a copied host buffer
-                    // allocate and copy
-                    size_t hsize = luma_linesize * height;
-                    uint8_t* host_copy = (uint8_t*)malloc(hsize);
-                    if (!host_copy) continue;
-                    memcpy(host_copy, processing_frame->data[0], hsize);
-                    prev_dev_ptr = host_copy;
-                    prev_linesize = luma_linesize;
-                    host_prev_alloc = true;
+                if (sampled_prev_host == nullptr) {
+                    // First frame: allocate compact host buffers and sample.
+                    sampled_prev_host = (uint8_t*)malloc((size_t)sampN);
+                    sampled_curr_host = (uint8_t*)malloc((size_t)sampN);
+                    if (!sampled_prev_host || !sampled_curr_host) { av_frame_unref(frame); ++frame_idx; continue; }
+                    sample_luma(dev_luma_ptr, luma_linesize, width, height, ds, sampled_prev_host, sampW, sampH);
+                    // Pre-allocate GPU buffers when a CUDA device is available so the
+                    // upload path is ready from the second frame onwards.
+                    if (hw_device_ctx && ensure_sampled_gpu_buffers(sampN)) {
+                        cudaMemcpy(sampled_prev_dev, sampled_prev_host, (size_t)sampN, cudaMemcpyHostToDevice);
+                    }
                 } else {
-                    // compute MAD between prev_dev_ptr (host) and current host pointer with optional downscale sampling
-                    uint8_t* cur = (uint8_t*)processing_frame->data[0];
-                    int ds = args.downscale < 1 ? 1 : args.downscale;
-                    int sampW = (width + ds - 1) / ds;
-                    int sampH = (height + ds - 1) / ds;
-                    double sum = 0.0;
-                    for (int y_ds=0;y_ds<sampH;++y_ds){
-                        int y = y_ds * ds; if (y >= height) y = height - 1;
-                        const uint8_t* r0 = prev_dev_ptr + y*prev_linesize;
-                        const uint8_t* r1 = cur + y*luma_linesize;
-                        for (int x_ds=0;x_ds<sampW;++x_ds){
-                            int x = x_ds * ds; if (x >= width) x = width - 1;
-                            sum += fabs((double)r0[x] - (double)r1[x]);
+                    // Subsequent frames: sample current frame and compute MAD.
+                    sample_luma(dev_luma_ptr, luma_linesize, width, height, ds, sampled_curr_host, sampW, sampH);
+
+                    float mad = 0.0f;
+                    if (hw_device_ctx && sampled_gpu_inited) {
+                        // Upload sampled pixels and compute MAD on the GPU.
+                        cudaMemcpy(sampled_curr_dev, sampled_curr_host, (size_t)sampN, cudaMemcpyHostToDevice);
+                        // Reuse compute_mad_cuda with pitch = sampW and downscale = 1
+                        // (pixels are already at the desired density).
+                        mad = compute_mad_cuda(sampled_prev_dev, sampW, sampled_curr_dev, sampW, sampW, sampH, 1);
+                        if (args.verbose && !cpu_path_logged) {
+                            std::cerr << "[CPU-decode] MAD via GPU upload; sampled " << sampW << "x" << sampH
+                                      << "=" << sampN << " px (downscale=" << ds << " from " << width << "x" << height << ")\n";
+                            cpu_path_logged = true;
+                        }
+                    } else {
+                        // Pure CPU MAD using AVX2 (if compiled with __AVX2__) or scalar.
+                        mad = compute_mad_cpu(sampled_prev_host, sampled_curr_host, sampN);
+                        if (args.verbose && !cpu_path_logged) {
+#ifdef __AVX2__
+                            std::cerr << "[CPU-decode] MAD via CPU/AVX2; sampled " << sampW << "x" << sampH
+                                      << "=" << sampN << " px (downscale=" << ds << " from " << width << "x" << height << ")\n";
+#else
+                            std::cerr << "[CPU-decode] MAD via CPU/scalar; sampled " << sampW << "x" << sampH
+                                      << "=" << sampN << " px (downscale=" << ds << " from " << width << "x" << height << ")\n";
+#endif
+                            cpu_path_logged = true;
                         }
                     }
-                    double mad = sum / (sampW * (double)sampH);
+
                     double ts = frame_idx * frame_time;
                     bool isCut = mad > args.threshold && (ts - last_cut_time)*1000.0 > args.minGapMs;
                     if (isCut){ last_cut_time = ts; std::cout<<ts<<", frame "<<frame_idx<<", mad="<<mad<<"\n"; if(csv) csv<<ts<<","<<frame_idx<<","<<mad<<"\n"; }
-                    // replace previous buffer (full-resolution copy for next comparison)
-                    memcpy((void*)prev_dev_ptr, cur, luma_linesize*height);
+
+                    // Swap compact buffers: curr becomes prev for the next frame.
+                    // No full-frame memcpy needed — only sampN bytes are ever touched.
+                    std::swap(sampled_prev_host, sampled_curr_host);
+                    if (sampled_gpu_inited) std::swap(sampled_prev_dev, sampled_curr_dev);
                 }
 
                 ++frame_idx;
@@ -318,6 +357,8 @@ int main(int argc, char** argv){
     if (hw_device_ctx) av_buffer_unref(&hw_device_ctx);
     avformat_network_deinit();
     if (cuda_buffers_inited){ cudaFree(prev_dev_owned); cudaFree(curr_dev_owned); }
-    if (host_prev_alloc && prev_dev_ptr) free((void*)prev_dev_ptr);
+    if (sampled_prev_host) free(sampled_prev_host);
+    if (sampled_curr_host) free(sampled_curr_host);
+    if (sampled_gpu_inited){ cudaFree(sampled_prev_dev); cudaFree(sampled_curr_dev); }
     return 0;
 }
