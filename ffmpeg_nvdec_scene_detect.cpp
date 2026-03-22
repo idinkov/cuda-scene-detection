@@ -129,7 +129,8 @@ int main(int argc, char** argv){
     std::ofstream csv;
     if (args.csv) { csv.open(*args.csv); if(!csv) { std::cerr<<"Could not open CSV\n"; } else csv<<"timestamp,frame_idx,mad\n"; }
 
-    // All-frames CSV: records MAD for every frame, not just detected cuts.
+    // All-frames CSV: records MAD for every frame with a valid measurement (starting from the second
+    // decoded frame, since MAD requires a previous frame to compare against).
     // Rows are buffered in memory and flushed every kAllFramesFlushInterval rows to keep I/O efficient.
     std::ofstream all_frames_csv;
     std::string all_frames_buf;

@@ -95,9 +95,9 @@ If CUDA device creation fails the program logs a warning and continues in softwa
 Two separate CSV outputs are available:
 
 - `--csv file.csv`: writes one row per **detected cut** with columns `timestamp,frame_idx,mad`.
-- `--all-frames-csv file.csv`: writes one row per **frame** with columns `timestamp,frame_idx,mad,is_cut`, where `is_cut` is `1` when a cut was detected and `0` otherwise. Output is buffered in memory (flushed every 1024 rows) to keep disk I/O efficient.
+- `--all-frames-csv file.csv`: writes one row per **frame with a valid MAD measurement** with columns `timestamp,frame_idx,mad,is_cut`, where `is_cut` is `1` when a cut was detected and `0` otherwise. Because MAD is computed against the previous frame, the very first decoded frame (typically `frame_idx = 0`) has no MAD and is not written; rows start from the second frame. Output is buffered in memory (flushed every 1024 rows) to keep disk I/O efficient.
 
-Both files include a header row. `--all-frames-csv` has no effect on detection performance when omitted.
+Both files include a header row. Enabling `--all-frames-csv` has no effect on detection performance when omitted.
 
 ### Offline analysis use cases
 - **Threshold tuning**: plot the MAD curve and choose a threshold that separates cuts from non-cut transitions.
