@@ -10,10 +10,11 @@ Lightweight demo tool that decodes video with FFmpeg + NVIDIA NVDEC (CUDA) and d
 - Graceful fallback to CPU MAD when frames are not on the GPU (still functional, slower).
 
 ## Algorithm (summary)
-1. Decode frames (prefer NVDEC). Obtain NV12 / YUV420 luma plane.
-2. Downsample logically by strided sampling factor `--downscale` (no resize kernel, just sampling points).
-3. Compute sum(|Y_t - Y_{t-1}|) and divide by sampled pixel count => MAD.
-4. Declare a cut if MAD > threshold AND time since last cut > min gap.
+1. Decode frames (prefer NVDEC). Obtain luma plane from any supported pixel format.
+2. `FrameNormalizer` extracts 8-bit luma: returns data[0] directly for planar 8-bit YUV formats, or converts via `sws_scale` for 10/12-bit, RGB, packed-YUV, and similar formats.
+3. Downsample logically by strided sampling factor `--downscale` (no resize kernel, just sampling points).
+4. Compute sum(|Y_t - Y_{t-1}|) and divide by sampled pixel count => MAD.
+5. Declare a cut if MAD > threshold AND time since last cut > min gap.
 
 GPU path: two pitched device buffers (previous/current). Kernel launches with 256 threads per block; each thread iterates over a strided subset accumulating into a 64‑bit global atomic counter. Result is copied back and normalized.
 
@@ -93,18 +94,37 @@ If CUDA device creation fails the program logs a warning and continues in softwa
 ## CSV Output
 When `--csv file.csv` is specified, only detected cuts are written (not every frame). Header: `timestamp,frame_idx,mad`.
 
+## Supported Pixel Formats
+Scene detection works on a broad range of pixel formats via the `FrameNormalizer` component:
+
+| Format group | Examples | Handling |
+|---|---|---|
+| 8-bit planar YUV | NV12, NV21, YUV420P, YUV422P, YUV444P, GRAY8, and JPEG/alpha variants | Direct – luma plane returned as-is (zero copy) |
+| 10/12-bit planar YUV | YUV420P10, YUV422P10, YUV444P10, YUV420P12, … | CPU swscale → YUV420P, luma extracted |
+| 10-bit semi-planar | P010LE, P010BE, P016LE, P016BE | CPU swscale → YUV420P, luma extracted |
+| Packed RGB / RGBA | RGB24, BGR24, RGBA, BGRA, ARGB, ABGR, RGB48 | CPU swscale → YUV420P, luma extracted |
+| Packed YUV | YUYV422, UYVY422, YVYU422 | CPU swscale → YUV420P, luma extracted |
+| Planar RGB | GBRP, GBRAP | CPU swscale → YUV420P, luma extracted |
+| High-bit-depth gray | GRAY10LE, GRAY12LE, GRAY16 | CPU swscale → YUV420P, luma extracted |
+| CUDA device surface | AV_PIX_FMT_CUDA | GPU path (direct device pointer, no CPU conversion) |
+
+The swscale conversion is done once per format/resolution change; the `SwsContext` is cached and reused for subsequent frames of the same type, minimising overhead.
+
+**Performance impact of the swscale path:** For formats that require conversion, each frame incurs an additional CPU pass proportional to frame area. On typical 1080p content with `--downscale 2` the extra cost is dominated by the swscale call rather than the CUDA MAD kernel, so enabling a software decoder together with an RGB or 10-bit source will be noticeably slower than an NV12 NVDEC path. When latency matters, prefer hardware-decoded NV12/CUDA output.
+
 ## Limitations / TODO
-- Only uses luma plane of NV12 / NV21 / YUV420P. Other pixel formats are skipped (could add swscale path).
 - Only detects hard cuts (no gradual dissolve detection).
-- CPU fallback path currently copies full luma each frame; could be optimized or moved fully to GPU with an upload.
+- CPU fallback path currently copies full luma each frame; could be optimized or moved fully to GPU with an upload (the `dev_luma_ptr` from `FrameNormalizer` can be passed directly to `cudaMemcpy`).
 - No multi-stream batch processing.
 - No adaptive thresholding.
 
 Future enhancements (ideas):
 - Add GPU downscale kernel for better sampling quality.
-- Support additional pixel formats via on-GPU conversion.
+- Implement on-GPU conversion kernels for common high-bit-depth formats (P010, YUV420P10) to skip the CPU swscale pass.
 - Sliding window variance / histogram metrics for more robust detection.
 - Optional output of all frame MAD values for offline analysis.
+
+
 
 ## Troubleshooting
 - Decoder not found: ensure FFmpeg build includes the codec and CUDA support (look for `h264_cuvid`, `hevc_cuvid`).

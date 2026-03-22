@@ -60,3 +60,28 @@ target_link_libraries(test_mad
 )
 
 add_test(NAME mad_tests COMMAND test_mad)
+
+# === Frame Normalizer tests (pure C++, no CUDA runtime required) ===
+add_executable(test_frame_normalizer
+        tests/test_frame_normalizer.cpp
+)
+
+target_include_directories(test_frame_normalizer PRIVATE ${FFMPEG_DIR}/include)
+
+if(WIN32)
+    target_link_libraries(test_frame_normalizer
+            avformat.lib
+            avcodec.lib
+            avutil.lib
+            swscale.lib
+    )
+else()
+    target_link_libraries(test_frame_normalizer
+            avformat
+            avcodec
+            avutil
+            swscale
+    )
+endif()
+
+add_test(NAME frame_normalizer_tests COMMAND test_frame_normalizer)

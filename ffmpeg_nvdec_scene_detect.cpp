@@ -51,6 +51,8 @@ extern "C" {
 #include <libswscale/swscale.h>
 }
 
+#include "frame_normalizer.h"
+
 // CUDA kernel declaration (implemented in cuda_kernels.cu)
 extern "C" float compute_mad_cuda(const uint8_t* frameA_dev, int pitchA, const uint8_t* frameB_dev, int pitchB, int width, int height, int downscale);
 
@@ -168,6 +170,7 @@ int main(int argc, char** argv){
     };
 
     bool have_prev = false;
+    FrameNormalizer normalizer; // handles all non-CUDA host-memory pixel formats
     // Main loop: read packets and send to decoder
     while (av_read_frame(fmt, pkt) >= 0){
         if (pkt->stream_index != video_stream){ av_packet_unref(pkt); continue; }
@@ -205,52 +208,56 @@ int main(int argc, char** argv){
             // FFmpeg uses AV_PIX_FMT_CUDA to indicate CUDA device memory; however availability depends on build. For portability,
             // we will handle two cases: device memory pointer accessible via processing_frame->data[0] (cuda) or host memory (sw).
 
-            // Only use luma plane for MAD. We handle both packed RGB and planar YUV by converting if needed.
-            // For simplicity: if pixel format is YUV420/420P (AV_PIX_FMT_NV12/AV_PIX_FMT_YUV420P), take data[0] as luma.
+            // Extract 8-bit luma plane. AV_PIX_FMT_CUDA means the frame lives
+            // in CUDA device memory; all other formats go through FrameNormalizer
+            // which returns a host pointer (converting via swscale if needed).
 
             int pix_fmt = processing_frame->format;
-            const uint8_t* dev_luma_ptr = nullptr; // pointer to device or host luma plane
+            const uint8_t* dev_luma_ptr = nullptr; // device or host luma plane
             int luma_linesize = 0;
             bool luma_on_device = false;
 
             if (pix_fmt == AV_PIX_FMT_CUDA) {
-                // If AV_PIX_FMT_CUDA, FFmpeg wraps a GPU surface. According to docs, data[] may contain device pointers.
-                // We'll assume data[0] contains a device pointer to Y (NV12) or packed data depending on decoder.
-                dev_luma_ptr = processing_frame->data[0];
-                luma_linesize = processing_frame->linesize[0];
+                // FFmpeg wraps a GPU surface; data[0] is a CUDA device pointer.
+                dev_luma_ptr   = processing_frame->data[0];
+                luma_linesize  = processing_frame->linesize[0];
                 luma_on_device = true;
-            } else if (pix_fmt == AV_PIX_FMT_NV12 || pix_fmt == AV_PIX_FMT_NV21 || pix_fmt == AV_PIX_FMT_YUV420P) {
-                dev_luma_ptr = processing_frame->data[0];
-                luma_linesize = processing_frame->linesize[0];
-                luma_on_device = false; // treat as host memory; upload before GPU MAD if desired
             } else {
-                // For packed formats like RGB, we need to convert to Y plane; fallback: use sw conversion to YUV on CPU (slow path)
-                // Convert to YUV420 on CPU then upload to CUDA and compute MAD. For brevity we skip this path in this example.
-                std::cerr<<"Unsupported pixel format (need Y plane). Consider building FFmpeg with CUDA hw frames in NV12/YUV420 formats.\n";
-                continue;
+                // Use FrameNormalizer: supports NV12/NV21/YUV420P/YUV422P/
+                // YUV444P/GRAY8 directly, and converts P010, RGB24, RGBA, packed
+                // YUV, 10/12-bit YUV, etc. to 8-bit luma via swscale.
+                if (!normalizer.get_luma(processing_frame, &dev_luma_ptr, &luma_linesize)) {
+                    if (args.verbose) {
+                        const char* name = av_get_pix_fmt_name(static_cast<AVPixelFormat>(pix_fmt));
+                        std::cerr << "Unsupported pixel format " << (name ? name : "unknown")
+                                  << " – skipping frame\n";
+                    }
+                    av_frame_unref(frame);
+                    ++frame_idx;
+                    continue;
+                }
+                luma_on_device = false;
             }
 
-            // If we don't have device luma pointer, perform a software copy to CUDA device using cudaMemcpy (user must have built with CUDA; compute_mad_cuda expects device pointers)
-            // For simplicity we assume dev_luma_ptr points to device memory when hw_device_ctx != null.
-            if (!luma_on_device) {
-                // Upload host luma plane to CUDA device memory. We'll use compute_mad_cuda which will internally cudaMalloc and free for temporary buffers.
-                // For simplicity we call compute_mad_cuda with host pointer but that function expects device pointer; in a production app you'd cudaMalloc & cudaMemcpy here.
-                // We'll skip this complex path in this demo; instead, we fall back to CPU-based MAD for this frame.
+            // If we don't have device luma pointer, perform a software copy to CUDA device memory.
+            // For non-CUDA frames the swscale output (or raw data[0] for direct formats) is on the
+            // host.  We fall back to CPU-based MAD for these frames; a future optimisation could
+            // upload dev_luma_ptr to a CUDA buffer and use the GPU path instead.
 
-                // CPU fallback MAD (very simple)
+            if (!luma_on_device) {
+                // CPU fallback MAD
                 if (prev_dev_ptr == nullptr) {
-                    // store host luma pointer for next iteration via a copied host buffer
-                    // allocate and copy
-                    size_t hsize = luma_linesize * height;
+                    // First frame: allocate and copy luma to host buffer
+                    size_t hsize = (size_t)luma_linesize * height;
                     uint8_t* host_copy = (uint8_t*)malloc(hsize);
-                    if (!host_copy) continue;
-                    memcpy(host_copy, processing_frame->data[0], hsize);
+                    if (!host_copy) { av_frame_unref(frame); ++frame_idx; continue; }
+                    memcpy(host_copy, dev_luma_ptr, hsize);
                     prev_dev_ptr = host_copy;
                     prev_linesize = luma_linesize;
                     host_prev_alloc = true;
                 } else {
-                    // compute MAD between prev_dev_ptr (host) and current host pointer with optional downscale sampling
-                    uint8_t* cur = (uint8_t*)processing_frame->data[0];
+                    // Compute MAD between prev_dev_ptr (host) and current host luma with optional downscale
+                    const uint8_t* cur = dev_luma_ptr;
                     int ds = args.downscale < 1 ? 1 : args.downscale;
                     int sampW = (width + ds - 1) / ds;
                     int sampH = (height + ds - 1) / ds;
@@ -268,8 +275,8 @@ int main(int argc, char** argv){
                     double ts = frame_idx * frame_time;
                     bool isCut = mad > args.threshold && (ts - last_cut_time)*1000.0 > args.minGapMs;
                     if (isCut){ last_cut_time = ts; std::cout<<ts<<", frame "<<frame_idx<<", mad="<<mad<<"\n"; if(csv) csv<<ts<<","<<frame_idx<<","<<mad<<"\n"; }
-                    // replace previous buffer (full-resolution copy for next comparison)
-                    memcpy((void*)prev_dev_ptr, cur, luma_linesize*height);
+                    // Replace previous buffer with current luma for next comparison
+                    memcpy((void*)prev_dev_ptr, cur, (size_t)luma_linesize*height);
                 }
 
                 ++frame_idx;
