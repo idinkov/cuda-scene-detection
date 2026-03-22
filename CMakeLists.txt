@@ -6,10 +6,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
-# Path to your FFmpeg installation (root folder containing include/ and lib/).
-# Override on the command line with -DFFMPEG_DIR=/path/to/ffmpeg, e.g.:
-#   cmake -B build -DFFMPEG_DIR=/usr
-set(FFMPEG_DIR "dependencies/ffmpeg/" CACHE PATH "Root directory of the FFmpeg installation (must contain include/ and lib/)")
+find_package(CUDAToolkit REQUIRED)
+
+# Adjust to your FFmpeg build location
+set(FFMPEG_DIR "dependencies/ffmpeg/")   # root folder where include/lib are
 include_directories(${FFMPEG_DIR}/include)
 link_directories(${FFMPEG_DIR}/lib)
 
@@ -39,6 +39,24 @@ else()
 endif()
 
 # Ensure CUDA architecture flags (adjust if you know your GPU SM version)
+# RTX 5070 = SM 120 (Blackwell)
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES 75 86)
+    set(CMAKE_CUDA_ARCHITECTURES 120)
 endif()
+
+# === Unit tests ===
+enable_testing()
+
+add_executable(test_mad
+        tests/test_mad.cu
+        cuda_kernels.cu
+)
+
+# nvcc uses shared cudart to avoid CRT mismatch (LNK4098)
+set_target_properties(test_mad PROPERTIES CUDA_RUNTIME_LIBRARY Shared)
+target_link_libraries(test_mad
+        CUDA::cudart
+        CUDA::cuda_driver
+)
+
+add_test(NAME mad_tests COMMAND test_mad)
