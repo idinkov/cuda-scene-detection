@@ -51,10 +51,11 @@ extern "C" {
 #include <libswscale/swscale.h>
 }
 
-// CUDA kernel declaration (implemented in cuda_kernels.cu)
+// CUDA kernel declarations (implemented in cuda_kernels.cu)
 extern "C" float compute_mad_cuda(const uint8_t* frameA_dev, int pitchA, const uint8_t* frameB_dev, int pitchB, int width, int height, int downscale);
+extern "C" float compute_mad_cuda_box(const uint8_t* frameA_dev, int pitchA, const uint8_t* frameB_dev, int pitchB, int width, int height, int downscale);
 
-struct Args { std::string input; double threshold=18.0; int minGapMs=400; bool verbose=false; std::optional<std::string> csv; int downscale=2; };
+struct Args { std::string input; double threshold=18.0; int minGapMs=400; bool verbose=false; std::optional<std::string> csv; int downscale=2; std::string downscaleMode="stride"; };
 
 static std::optional<Args> parse_args(int argc, char** argv){
     if (argc < 2) return std::nullopt;
@@ -63,6 +64,12 @@ static std::optional<Args> parse_args(int argc, char** argv){
         else if(k=="--min-gap-ms" && i+1<argc) a.minGapMs=std::stoi(argv[++i]);
         else if(k=="--csv" && i+1<argc) a.csv=argv[++i];
         else if(k=="--downscale" && i+1<argc) a.downscale=std::max(1, std::stoi(argv[++i]));
+        else if(k=="--downscale-mode" && i+1<argc){
+            a.downscaleMode=argv[++i];
+            if (a.downscaleMode != "stride" && a.downscaleMode != "box"){
+                std::cerr<<"--downscale-mode must be 'stride' or 'box'\n"; return std::nullopt;
+            }
+        }
         else if(k=="--verbose") a.verbose=true;
         else { std::cerr<<"Unknown arg: "<<k<<"\n"; return std::nullopt; }
     }
@@ -76,7 +83,7 @@ static std::string av_err2str_wrap(int err){ char buf[256]; av_strerror(err, buf
 int main(int argc, char** argv){
     av_log_set_level(AV_LOG_ERROR);
     auto parsed = parse_args(argc, argv);
-    if(!parsed){ std::cerr<<"Usage: "<<argv[0]<<" <input> [--threshold <val>] [--min-gap-ms <ms>] [--downscale <n>] [--csv <path>] [--verbose]\n"; return 2; }
+    if(!parsed){ std::cerr<<"Usage: "<<argv[0]<<" <input> [--threshold <val>] [--min-gap-ms <ms>] [--downscale <n>] [--downscale-mode stride|box] [--csv <path>] [--verbose]\n"; return 2; }
     Args args = *parsed;
 
     avformat_network_init();
@@ -294,7 +301,11 @@ int main(int argc, char** argv){
                 have_prev = true; // stored first frame into prev_dev_owned
             } else {
                 // current frame just copied into curr_dev_owned, compute MAD
-                float mad = compute_mad_cuda(prev_dev_owned, (int)prev_pitch, curr_dev_owned, (int)curr_pitch, width, height, args.downscale);
+                float mad;
+                if (args.downscaleMode == "box")
+                    mad = compute_mad_cuda_box(prev_dev_owned, (int)prev_pitch, curr_dev_owned, (int)curr_pitch, width, height, args.downscale);
+                else
+                    mad = compute_mad_cuda(prev_dev_owned, (int)prev_pitch, curr_dev_owned, (int)curr_pitch, width, height, args.downscale);
                 double ts = frame_idx * frame_time;
                 bool isCut = mad > args.threshold && (ts - last_cut_time)*1000.0 > args.minGapMs;
                 if (isCut){ last_cut_time = ts; std::cout<<ts<<", frame "<<frame_idx<<", mad="<<mad<<"\n"; if(csv) csv<<ts<<","<<frame_idx<<","<<mad<<"\n"; }
