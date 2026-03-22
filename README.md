@@ -58,25 +58,65 @@ nvcc -O2 -arch=sm_75 -c cuda_kernels.cu -o cuda_kernels.o
 Or use CMake by adapting `CMakeLists.txt` (add pkg-config discovery as commented in cuda_kernels.cu).
 
 ## Usage
+
+### Single stream
 ```
 nvdec_scene_detect <input> [--threshold <val>] [--min-gap-ms <ms>] [--downscale <n>] [--csv <file>] [--verbose]
 ```
+
+### Batch / multi-stream
+```
+nvdec_scene_detect <input1> <input2> ... [options]
+nvdec_scene_detect --input-list <list-file> [options]
+```
+
 Options:
 - `--threshold` (float, default 18.0): MAD cut threshold.
 - `--min-gap-ms` (int, default 400): Minimum time between reported cuts (debounce).
 - `--downscale` (int, default 2): Spatial sampling stride (1 = full res). Higher = faster, noisier.
-- `--csv` (path): Write `timestamp,frame_idx,mad` lines for each detected cut.
-- `--verbose`: Extra diagnostic logs.
+- `--csv` (path): Write `timestamp,frame_idx,mad` lines for each detected cut. In batch mode each stream gets its own file derived from this base path (e.g. `cuts_0.csv`, `cuts_1.csv`).
+- `--verbose`: Extra diagnostic logs; also prints per-stream metrics for single-stream runs.
+- `--input-list` (path): Text file with one video path per line. Blank lines and lines starting with `#` are ignored. Can be combined with positional inputs.
+- `--jobs` (int, default 0 = unlimited): Maximum number of streams to decode in parallel.
 
-Example:
+Examples:
 ```
+# Single stream (output format unchanged)
 nvdec_scene_detect sample.mp4 --threshold 20 --min-gap-ms 500 --downscale 4 --csv cuts.csv
+
+# Batch: two files in parallel
+nvdec_scene_detect a.mp4 b.mp4 --threshold 18 --csv out.csv
+
+# Batch: load list from file, limit to 4 parallel jobs
+nvdec_scene_detect --input-list videos.txt --jobs 4 --csv cuts.csv
 ```
-Console output line example:
+
+Console output per detected cut (single stream):
 ```
 12.4667, frame 374, mad=37.21
 ```
-Meaning: scene cut at 12.4667s on frame 374 with MAD 37.21.
+In batch mode each cut line is prefixed with the stream index:
+```
+[stream 0] 12.4667, frame 374, mad=37.21
+[stream 1] 5.1333, frame 154, mad=42.08
+```
+
+After all streams finish a summary table is printed:
+```
+=== Batch Processing Summary ===
+Stream 0: a.mp4
+  Frames decoded : 2400
+  Cuts detected  : 8
+  Wall time      : 24.1 s
+  Throughput     : 99.5 fps
+Stream 1: b.mp4
+  Frames decoded : 1800
+  Cuts detected  : 5
+  Wall time      : 18.7 s
+  Throughput     : 96.2 fps
+
+Total: 2 streams, 4200 frames, 13 cuts
+```
 
 ## Determining Proper Threshold
 Start with default (18) and inspect a few sample outputs. Increase if you see false positives; decrease if cuts are missed. Because MAD uses only Y plane and simple sampling, optimal values vary by content and downscale factor.
@@ -93,11 +133,43 @@ If CUDA device creation fails the program logs a warning and continues in softwa
 ## CSV Output
 When `--csv file.csv` is specified, only detected cuts are written (not every frame). Header: `timestamp,frame_idx,mad`.
 
+## Multi-stream Architecture
+
+```
+ ┌──────────────────────────────────────────────────────────┐
+ │  main thread                                             │
+ │  • parses args, collects input paths                     │
+ │  • starts GPU worker thread                              │
+ │  • launches one decoder thread per stream                │
+ │    (bounded by --jobs when set)                          │
+ └────────────────┬─────────────────────────────────────────┘
+                  │ spawns
+      ┌───────────┼────────────┐
+      ▼           ▼            ▼
+ decoder 0   decoder 1  ...  decoder N-1
+ (thread)    (thread)        (thread)
+   │               │               │
+   │  GPU tasks    │  GPU tasks     │  GPU tasks
+   └───────────────┴───────────────┴──► GpuWorkQueue
+                                              │
+                                         GPU worker
+                                         (single thread)
+                                         calls compute_mad_cuda()
+                                         sets std::promise result
+                                              │
+                                  each decoder fut.get() ◄──┘
+                                  checks threshold, reports cut
+```
+
+- **Decoder threads** handle all FFmpeg demux/decode work (CPU-bound).
+- **GpuWorkQueue** serialises CUDA calls from multiple threads behind a single worker thread, avoiding context contention and allowing the GPU to stay fully utilised.
+- **Per-stream metrics** (latency, throughput) are recorded independently and printed in a summary table after all streams complete.
+
+
 ## Limitations / TODO
 - Only uses luma plane of NV12 / NV21 / YUV420P. Other pixel formats are skipped (could add swscale path).
 - Only detects hard cuts (no gradual dissolve detection).
 - CPU fallback path currently copies full luma each frame; could be optimized or moved fully to GPU with an upload.
-- No multi-stream batch processing.
 - No adaptive thresholding.
 
 Future enhancements (ideas):

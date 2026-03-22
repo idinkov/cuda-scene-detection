@@ -5,6 +5,11 @@
 #include <cstdlib>
 #include <cmath>
 #include <vector>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <queue>
+#include <future>
 
 extern "C" float compute_mad_cuda(const uint8_t* frameA_dev, int pitchA,
                                    const uint8_t* frameB_dev, int pitchB,
@@ -98,6 +103,121 @@ static void test_downscale() {
     g_passed++;
 }
 
+// ---------------------------------------------------------------------------
+// Minimal GpuWorkQueue re-implementation for testing the queue/thread logic.
+// This mirrors the class in ffmpeg_nvdec_scene_detect.cpp.
+// ---------------------------------------------------------------------------
+
+struct GpuTask_t {
+    const uint8_t* a_dev;  int pitch_a;
+    const uint8_t* b_dev;  int pitch_b;
+    int width, height, downscale;
+    std::promise<float> result;
+};
+
+class GpuWorkQueue_t {
+public:
+    std::future<float> submit(const uint8_t* a, int pa, const uint8_t* b, int pb,
+                               int w, int h, int ds) {
+        GpuTask_t task;
+        task.a_dev = a; task.pitch_a = pa;
+        task.b_dev = b; task.pitch_b = pb;
+        task.width = w; task.height = h; task.downscale = ds;
+        auto fut = task.result.get_future();
+        { std::unique_lock<std::mutex> lk(mtx_); queue_.push(std::move(task)); }
+        cv_.notify_one();
+        return fut;
+    }
+    void shutdown() {
+        { std::unique_lock<std::mutex> lk(mtx_); done_ = true; }
+        cv_.notify_all();
+    }
+    void run() {
+        while (true) {
+            std::unique_lock<std::mutex> lk(mtx_);
+            cv_.wait(lk, [this]{ return !queue_.empty() || done_; });
+            if (queue_.empty()) break;
+            GpuTask_t task = std::move(queue_.front()); queue_.pop();
+            lk.unlock();
+            float mad = compute_mad_cuda(task.a_dev, task.pitch_a,
+                                         task.b_dev, task.pitch_b,
+                                         task.width, task.height, task.downscale);
+            task.result.set_value(mad);
+        }
+    }
+private:
+    std::mutex mtx_;
+    std::condition_variable cv_;
+    std::queue<GpuTask_t> queue_;
+    bool done_ = false;
+};
+
+// Test: GpuWorkQueue produces the same MAD result as a direct call.
+static void test_gpu_work_queue_single() {
+    int w = 64, h = 64;
+    size_t pA, pB;
+    uint8_t* a = alloc_dev_frame(w, h, &pA, 80);
+    uint8_t* b = alloc_dev_frame(w, h, &pB, 140);
+    ASSERT_TRUE(a && b);
+
+    GpuWorkQueue_t q;
+    std::thread worker([&q]{ q.run(); });
+
+    auto fut = q.submit(a, (int)pA, b, (int)pB, w, h, 1);
+    float queue_mad = fut.get();
+
+    q.shutdown();
+    worker.join();
+
+    // Expected MAD = |80-140| = 60
+    ASSERT_NEAR(queue_mad, 60.0f, 0.5f);
+    cudaFree(a); cudaFree(b);
+    g_passed++;
+}
+
+// Test: multiple tasks submitted by concurrent threads all resolve correctly.
+static void test_gpu_work_queue_concurrent() {
+    const int N = 4;
+    int w = 64, h = 64;
+
+    GpuWorkQueue_t q;
+    std::thread worker([&q]{ q.run(); });
+
+    // Each "stream" submits one task from its own thread.
+    std::vector<std::thread> threads;
+
+    for (int i = 0; i < N; ++i) {
+        threads.emplace_back([&, i]{
+            size_t pA, pB;
+            uint8_t val_a = (uint8_t)(i * 20);
+            uint8_t val_b = (uint8_t)(i * 20 + 10);
+            uint8_t* a = alloc_dev_frame(w, h, &pA, val_a);
+            uint8_t* b = alloc_dev_frame(w, h, &pB, val_b);
+            if (!a || !b) {
+                fprintf(stderr, "  FAIL (concurrent stream %d): frame alloc failed\n", i);
+                g_failed++;
+                if (a) cudaFree(a);
+                if (b) cudaFree(b);
+                return;
+            }
+            auto fut = q.submit(a, (int)pA, b, (int)pB, w, h, 1);
+            float mad = fut.get();
+            // MAD should equal 10 for every stream
+            if (fabsf(mad - 10.0f) > 0.5f) {
+                fprintf(stderr, "  FAIL (concurrent stream %d): got %f vs 10.0\n", i, mad);
+                g_failed++;
+            }
+            cudaFree(a); cudaFree(b);
+        });
+    }
+
+    for (auto& t : threads) t.join();
+    q.shutdown();
+    worker.join();
+
+    g_passed++;
+}
+
 int main() {
     fprintf(stderr, "=== nvdec_scene_detect Unit Tests ===\n");
 
@@ -114,6 +234,8 @@ int main() {
     fprintf(stderr, "  test_zero_dim...\n"); test_zero_dim();
     fprintf(stderr, "  test_large...\n"); test_large();
     fprintf(stderr, "  test_downscale...\n"); test_downscale();
+    fprintf(stderr, "  test_gpu_work_queue_single...\n"); test_gpu_work_queue_single();
+    fprintf(stderr, "  test_gpu_work_queue_concurrent...\n"); test_gpu_work_queue_concurrent();
 
     fprintf(stderr, "\nResults: %d passed, %d failed\n", g_passed, g_failed);
     return g_failed > 0 ? 1 : 0;
