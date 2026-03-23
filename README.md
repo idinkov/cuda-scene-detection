@@ -11,11 +11,13 @@ Lightweight demo tool that decodes video with FFmpeg + NVIDIA NVDEC (CUDA) and d
 
 ## Algorithm (summary)
 1. Decode frames (prefer NVDEC). Obtain NV12 / YUV420 luma plane.
-2. Downsample logically by strided sampling factor `--downscale` (no resize kernel, just sampling points).
+2. Downsample the luma plane using the selected `--downscale-mode`:
+   - **stride** (default): logical stride-sampling — picks every Nth pixel, no averaging.
+   - **box**: GPU box-filter (average-pooling) kernel — averages each N×N block to one output pixel before comparison. Produces a smoother, less-noisy sampled image at the cost of 2 extra kernel launches per frame pair (one per luma plane).
 3. Compute sum(|Y_t - Y_{t-1}|) and divide by sampled pixel count => MAD.
 4. Declare a cut if MAD > threshold AND time since last cut > min gap.
 
-GPU path: two pitched device buffers (previous/current). Kernel launches with 256 threads per block; each thread iterates over a strided subset accumulating into a 64‑bit global atomic counter. Result is copied back and normalized.
+GPU path: two pitched device buffers (previous/current). Kernel launches with 256 threads per block (stride mode) or a 2-D 16×16 thread-block grid (box mode). In box mode `downscale_box_kernel` is launched twice per frame pair (once per luma plane) using `__ldg` read-only cached loads to average each N×N source block into one output pixel, then the MAD kernel runs on the smaller downscaled images. Result is copied back and normalized.
 
 ## Build Requirements
 - NVIDIA GPU + driver supporting CUDA and NVDEC.
@@ -59,18 +61,21 @@ Or use CMake by adapting `CMakeLists.txt` (add pkg-config discovery as commented
 
 ## Usage
 ```
-nvdec_scene_detect <input> [--threshold <val>] [--min-gap-ms <ms>] [--downscale <n>] [--csv <file>] [--verbose]
+nvdec_scene_detect <input> [--threshold <val>] [--min-gap-ms <ms>] [--downscale <n>] [--downscale-mode stride|box] [--csv <file>] [--verbose]
 ```
 Options:
 - `--threshold` (float, default 18.0): MAD cut threshold.
 - `--min-gap-ms` (int, default 400): Minimum time between reported cuts (debounce).
-- `--downscale` (int, default 2): Spatial sampling stride (1 = full res). Higher = faster, noisier.
+- `--downscale` (int, default 2): Spatial sampling factor (1 = full res). Higher = faster, fewer pixels sampled.
+- `--downscale-mode` (`stride`|`box`, default `stride`): Downscale algorithm.
+  - `stride`: pick every Nth pixel — fast, one kernel, slightly noisier at high `--downscale` values.
+  - `box`: GPU box-filter (average-pool) each N×N block — better sampling quality, 2 extra kernel launches per frame pair (one per luma plane) plus per-call temp buffer allocations. GPU-only; falls back to stride with a warning on the CPU path.
 - `--csv` (path): Write `timestamp,frame_idx,mad` lines for each detected cut.
 - `--verbose`: Extra diagnostic logs.
 
 Example:
 ```
-nvdec_scene_detect sample.mp4 --threshold 20 --min-gap-ms 500 --downscale 4 --csv cuts.csv
+nvdec_scene_detect sample.mp4 --threshold 20 --min-gap-ms 500 --downscale 4 --downscale-mode box --csv cuts.csv
 ```
 Console output line example:
 ```
@@ -96,12 +101,23 @@ When `--csv file.csv` is specified, only detected cuts are written (not every fr
 ## Limitations / TODO
 - Only uses luma plane of NV12 / NV21 / YUV420P. Other pixel formats are skipped (could add swscale path).
 - Only detects hard cuts (no gradual dissolve detection).
-- CPU fallback path currently copies full luma each frame; could be optimized or moved fully to GPU with an upload.
+- CPU fallback path currently copies full luma each frame and uses stride sampling; box mode is GPU-only.
 - No multi-stream batch processing.
 - No adaptive thresholding.
 
+## Downscale Mode Tradeoffs
+
+| Mode | How it works | Speed | Quality |
+|------|-------------|-------|---------|
+| `stride` | Reads every Nth pixel | Fastest (1 kernel, minimal reads) | Noisier at high downscale factors; aliasing possible |
+| `box` | Averages each N×N block (GPU box-filter) | Slightly slower (2 extra kernel launches + temp buffers per frame pair; GPU-only) | Smoother MAD signal, less sensitive to single-pixel noise |
+
+**Recommendations:**
+- Use `stride` for fast scanning or low downscale values (≤ 2).
+- Use `box` when `--downscale` ≥ 4 or when content has fine texture that causes false positives with stride sampling.
+- For uniform content the two modes produce identical results.
+
 Future enhancements (ideas):
-- Add GPU downscale kernel for better sampling quality.
 - Support additional pixel formats via on-GPU conversion.
 - Sliding window variance / histogram metrics for more robust detection.
 - Optional output of all frame MAD values for offline analysis.
